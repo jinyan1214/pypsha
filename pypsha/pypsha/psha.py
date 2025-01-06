@@ -14,6 +14,8 @@ import shutil
 import re
 import pickle
 import copy
+from tqdm import tqdm
+import geopandas as gpd
 
 from itertools import combinations, combinations_with_replacement
 from scipy.interpolate import LinearNDInterpolator, interp1d
@@ -294,6 +296,242 @@ class PSHASite:
             data_path = os.path.join(self.files.master, self.name + '_data.csv')
             self.output.data.to_csv(data_path)
 
+    def run_r2d_opensha(self, outdir_name: Optional[str] = None, overwrite: bool = False, path_to_SC_GM_backend: str = None, write_output_tofile: bool = False) -> None:
+        self.output = SiteOutput()
+        # define the sites in SimCenter format
+        if outdir_name is None:
+            outdir_name = f"{self.name}_opensha_output"
+        self.files.opensha_output = outdir_name
+    
+        current_dir = os.getcwd()
+        os.chdir(self.files.opensha)
+
+        if os.path.exists(outdir_name) and (not overwrite):
+            raise Warning("OpenSHA output folder already exists, provide overwrite True to overwrite")
+        
+        import sys
+        sys.path.append(path_to_SC_GM_backend)
+        from CreateStation import create_stations 
+        from FetchOpenSHA import getERF, export_to_json
+        from ComputeIntensityMeasure import get_gmpe_from_im_vector, get_im_dict, IM_Calculator
+        from gmpe import openSHAGMPE
+        from CreateScenario import load_earthquake_rupFile
+        sites_input_config = self._create_r2d_sites()
+        stations = create_stations(sites_input_config['input_file'],
+                        sites_input_config['output_file'],
+                        sites_input_config['filter'],
+                        sites_input_config['Vs30'],
+                        sites_input_config['Z1pt0'],
+                        sites_input_config['Z2pt5'])
+        stations_df = pd.DataFrame.from_records(stations['Stations'])
+        stations_df = stations_df.rename(columns={'Latitude':'lat', 'Longitude':'lon',
+                                                  'Vs30':'vs30'})
+        scenario_info = self._create_r2d_scenario_info()
+        eq_source = getERF(scenario_info)
+        ref_station = [stations_df['lat'].mean(), stations_df['lon'].mean()]
+        rupture_file = os.path.join(self.files.user, 'RupFile.geojson')
+        _ = export_to_json(
+                eq_source,
+                ref_station,
+                outfile=rupture_file,
+                EqName=scenario_info['EqRupture'].get('Name', None),
+                minMag=scenario_info['EqRupture'].get('min_Mag', 2.5),
+                maxMag=scenario_info['EqRupture'].get('max_Mag', 10.0),
+                maxDistance=scenario_info['EqRupture'].get('max_Dist', 300.0),
+                use_hdf5=scenario_info['EqRupture'].get('use_hdf5', False),
+            )
+        scenarios = load_earthquake_rupFile(scenario_info, rupture_file)
+        # for all ruptures compute the mu, tau, eta for all sites
+        im_info, gmpe_info = self._create_im_info()
+        gmpe_dict, gmpe_weights_dict = get_gmpe_from_im_vector(im_info, gmpe_info)
+        im_dict = get_im_dict(im_info)
+        im_calculator = IM_Calculator(
+            im_dict=im_dict,
+            gmpe_dict=gmpe_dict,
+            gmpe_weights_dict=gmpe_weights_dict,
+            site_info=stations_df.to_dict(orient='records'),
+        )
+        im_calculator.erf = eq_source
+        gmpe_set = set()
+        for _, item in gmpe_dict.items():  # noqa: PERF102
+            gmpe_set = gmpe_set.union(set(item))
+        for gmpe in gmpe_set:
+            if gmpe == 'Chiou & Youngs (2014)':
+                im_calculator.CY = openSHAGMPE.chiou_youngs_2013()
+            if gmpe == 'Abrahamson, Silva & Kamai (2014)':
+                im_calculator.ASK = openSHAGMPE.abrahamson_silva_kamai_2014()
+            if gmpe == 'Boore, Stewart, Seyhan & Atkinson (2014)':
+                im_calculator.BSSA = openSHAGMPE.boore_etal_2014()
+            if gmpe == 'Campbell & Bozorgnia (2014)':
+                im_calculator.CB = openSHAGMPE.campbell_bozorgnia_2014()
+        im_dataframe = {}
+        im_dataframe['IM_type'] = []
+        im_dataframe['source_id'] = []
+        im_dataframe['rupture_id'] = []
+        mu_data = np.empty((0, len(stations_df)), float)
+        sigma_data = np.empty((0, len(stations_df)), float)
+        tau_data = np.empty((0, len(stations_df)), float)
+        for i in tqdm(
+            range(len(scenarios.keys())),
+            desc=f'Evaluate GMPEs for {len(scenarios.keys())} scenarios',
+        ):
+            # for i, key in enumerate(scenarios.keys()):
+            # print('ComputeIntensityMeasure: Scenario #{}/{}'.format(i+1,len(scenarios)))
+            # Rupture
+            key = int(list(scenarios.keys())[i])
+            source_info = scenarios[key]
+            im_calculator.set_source(source_info)
+            # Computing IM
+            for cur_im_type in list(im_dict.keys()):
+                im_calculator.set_im_type(cur_im_type)
+                im_result = im_calculator.calculate_im()['GroundMotions']
+                if cur_im_type == 'SA':
+                    for p_i, period in enumerate(im_dict[cur_im_type]['Periods']):
+                        im_dataframe['IM_type'].append(f'{cur_im_type}_{period}')
+                        im_dataframe['source_id'].append(source_info['SourceIndex'])
+                        im_dataframe['rupture_id'].append(source_info['RuptureIndex'])
+                        mu_i = np.array([x['lnSA']['Mean'][p_i] for x in im_result])
+                        sigma_i = np.array([x['lnSA']['TotalStdDev'][p_i] for x in im_result])
+                        tau_i = np.array([x['lnSA']['InterEvStdDev'][p_i] for x in im_result])
+                        mu_data = np.vstack((mu_data, mu_i))
+                        sigma_data = np.vstack((sigma_data, sigma_i))
+                        tau_data = np.vstack((tau_data, tau_i))
+                else:
+                    im_dataframe['IM_type'].append(cur_im_type)
+                    im_dataframe['source_id'].append(source_info['SourceIndex'])
+                    im_dataframe['rupture_id'].append(source_info['RuptureIndex'])
+                    mu_i = np.array([x[f'ln{cur_im_type}']['Mean'][0] for x in im_result])
+                    sigma_i = np.array([x[f'ln{cur_im_type}']['TotalStdDev'][0] for x in im_result])
+                    tau_i = np.array([x[f'ln{cur_im_type}']['InterEvStdDev'][0] for x in im_result])
+                    mu_data = np.vstack((mu_data, mu_i))
+                    sigma_data = np.vstack((sigma_data, sigma_i))
+                    tau_data = np.vstack((tau_data, tau_i))
+        index_dataframe = pd.MultiIndex.from_arrays(
+                [im_dataframe['IM_type'], ['mu']*len(im_dataframe['IM_type']), im_dataframe['source_id'], im_dataframe['rupture_id']],
+                names=['im_map', 'descriptor', 'source_id', 'rupture_id']
+            )
+        mu_dataframe = pd.DataFrame(mu_data, columns=[f'site{i}' for i in range(len(stations_df))], index = index_dataframe)
+        index_dataframe = pd.MultiIndex.from_arrays(
+                [im_dataframe['IM_type'], ['sigma']*len(im_dataframe['IM_type']), im_dataframe['source_id'], im_dataframe['rupture_id']],
+                names=['im_map', 'descriptor', 'source_id', 'rupture_id']
+            )
+        sigma_dataframe = pd.DataFrame(sigma_data, columns=[f'site{i}' for i in range(len(stations_df))], index = index_dataframe)
+        index_dataframe = pd.MultiIndex.from_arrays(
+                [im_dataframe['IM_type'], ['tau']*len(im_dataframe['IM_type']), im_dataframe['source_id'], im_dataframe['rupture_id']],
+                names=['im_map', 'descriptor', 'source_id', 'rupture_id']
+            )
+        tau_dataframe = pd.DataFrame(tau_data, columns=[f'site{i}' for i in range(len(stations_df))], index = index_dataframe)
+        total_dataframe = pd.concat([mu_dataframe, sigma_dataframe, tau_dataframe])
+        total_dataframe = total_dataframe.sort_index()
+        self.output.data = total_dataframe
+        metadata_df = gpd.read_file(rupture_file)
+        metadata_df = metadata_df[['Name', 'Magnitude','Rupture', 'Source', 'MeanAnnualRate', 'geometry']]
+        metadata_df = metadata_df.rename(columns={'MeanAnnualRate':'annualized_rate', 'Magnitude':'magnitude', 'Name':'name',
+                                                  'Rupture':'rupture_id', 'Source':'source_id'})
+        metadata_df = metadata_df.set_index(['source_id', 'rupture_id'])
+        self.output.metadata = metadata_df
+        
+        os.chdir(current_dir)
+        
+        if write_output_tofile:
+            metadata_path = os.path.join(self.files.master, self.name + '_metadata.csv')
+            self.output.metadata.to_csv(metadata_path)
+            
+            data_path = os.path.join(self.files.master, self.name + '_data.csv')
+            self.output.data.to_csv(data_path)
+        
+        self.output.sites = stations_df.rename(columns={'lat':'y', 'lon':'x'})
+        
+
+    def _create_r2d_sites(self):
+        site_filename = self.files.site_filename
+        site_filepath = os.path.join(self.files.user, site_filename)
+        site_df = pd.read_csv(site_filepath)
+        site_df = site_df.rename(columns={'x':'Longitude', 'y':'Latitude', 'vs30':'Vs30'})
+        site_df = site_df.reset_index()
+        site_df = site_df.rename(columns={'index':'ID', 'x':'lon', 'y':'lat'})
+        r2d_sites_file_path = os.path.join(self.files.user, 'sites_simcenter_format.csv')
+        site_df.to_csv(r2d_sites_file_path, index=False)
+        r2d_sites_model_file_path = os.path.join(self.files.user, 'SimCenterSiteModel.csv')
+        sites_input_config = {
+            "Type": "From_CSV",
+            "Vs30": {
+                "Parameters": {
+                    "vsInferred": False
+                },
+                "Type": "User-specified"
+            },
+            "Z1pt0": {
+                "Type": "OpenSHA default model",
+                "z1_tag": 2,
+                "num_cores": 4
+            },
+            "Z2pt5": {
+                "Type": "OpenSHA default model",
+                "z25_tag": 2,
+                "num_cores": 4
+            },
+            "filter": "",
+            "input_file": r2d_sites_file_path,
+            "output_file": r2d_sites_model_file_path
+        }
+        return sites_input_config
+
+    def _create_r2d_scenario_info(self):
+        scenario_info = {}
+        scenario_info['EqRupture'] = {}
+        scenario_info['EqRupture']['Type'] = 'ERF'
+        scenario_info['Generator'] = {'method':'Subsampling'}
+        if self.ground_motion_params.erf == 1:
+            scenario_info['EqRupture']['Model'] = self.ERF_OPTIONS[
+                self.ground_motion_params.erf]
+        else:
+            raise NotImplementedError("Only ERF 1 is supported")
+        scenario_info['EqRupture']['ModelParameters'] = {
+            'Background Seismicity':self.BACKGROUND_SEISMICITY_OPTIONS[
+                self.ground_motion_params.background_seismicity
+            ],
+            "Floater Type": "Along strike & centered down dip",
+            "Probability Model": "Poisson",
+            "Rupture Offset": 5,
+        }
+        if self.ground_motion_params.background_seismicity == 1:
+            scenario_info['EqRupture']['ModelParameters'].update({
+                "Treat Background Seismicity As": "Point Sources"
+            })
+        return scenario_info
+    def _create_im_info(self):
+        attenuations = np.array(self.ground_motion_params.attenuations)
+        if attenuations.shape[0] > 1:
+            raise NotImplementedError("Only one attenuation model is supported")
+        attenuation = self.ATTENUATIONS_OPTIONS[attenuations[0]]
+        intensity_measures = np.array(self.ground_motion_params.intensity_measures)
+        spectral_periods = np.array(self.ground_motion_params.spectral_periods)
+        im_info = {}
+        for im in intensity_measures:
+                im_str = self.IMS_OPTIONS[im]
+                im_info.update({im_str: {
+                    "GMPE": attenuation,
+                    "Type": im_str
+                }})
+                if im_str=='SA':
+                    im_info[im_str].update({'Periods': spectral_periods})
+        if len(intensity_measures) > 1:
+            im_info.update({'Type': 'Vector'})
+        gmpe_info = {"GMPE": {
+            "Parameters": {
+            },
+            "Type": "Vector"
+        }}
+
+        return im_info, gmpe_info
+                    
+        
+
+
+    
+
+
 class EventSetOutput:
     def __init__(self):
         self.intensity_df = None
@@ -549,7 +787,7 @@ class PshaEventSet:
             imdf = self.maps[intensity_id]
             imvals_broad = np.repeat(imvals.reshape((-1,1)),imdf.shape[1],axis=1)
             rate_exceedance = np.zeros((imvals.shape[0],imdf.shape[1]))
-            for source,rupture in self.events.metadata.index:
+            for source,rupture in tqdm(self.events.metadata.index, total=self.events.metadata.shape[0], desc=f'Generating Hazard Curves for {intensity_id}'):
                 imdf_event = imdf.loc[source,rupture,:]
                 rate_exceedance+=imdf_event.apply(lambda x : 1 - ECDF(x)(imvals),axis=0).values*self.events.metadata.loc[source,rupture].annualized_rate
             self.hazard_curves[intensity_id] = (imvals_broad,rate_exceedance)
@@ -559,12 +797,19 @@ class PshaEventSet:
                          log10_hz_curve_res = 0.05,
                          candies_per_event = 5,
                          candies_site_indices=None,
-                         verbose=True):
+                         verbose=True,
+                         fault_only = False):
                          # solver='SCS'
                          # eps=1e-7,eps_infeas=1e-9,
                          # max_iters= 500000):
         
         imdf = copy.deepcopy(self.maps[intensity_id])
+        if fault_only:
+            # find the event indices that contains "FaultPoisSource"
+            mask = self.events.metadata.name.apply(lambda x: "FaultPoisSource" not in x)
+            fault_source_ids = self.events.metadata[mask].source_id.unique()
+            imdf = imdf.loc[fault_source_ids,:,:]
+            
         nsites = imdf.shape[1]
         
         if (hazard_curves is None) and ( intensity_id not in self.hazard_curves.keys()):
@@ -625,3 +870,9 @@ class PshaEventSet:
         self.optimization_output.interpolated_return_periods = curve_points
         
         return None
+    
+    def set_updated_catalog(self, new_catalog):
+        # This is used to update the catalog after the annual rate is updated
+        # when mainshock-aftershock model is used
+        self.events.metadata = new_catalog
+        

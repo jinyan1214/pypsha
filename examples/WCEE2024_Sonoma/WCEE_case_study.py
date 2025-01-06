@@ -4,6 +4,10 @@ Created on Sat Apr 29 13:21:41 2023
 
 @author: Neetesh
 """
+# add path to the pypsha package
+import sys
+sys.path.append('/Users/jinyanzhao/Desktop/EQSimulationTool/AfterShock/pypsha/pypsha')
+path_to_SC_GM_backend = '/Users/jinyanzhao/Desktop/SimCenterBuild/SimCenterBackendApplications/modules/performRegionalEventSimulation/regionalGroundMotion'
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -29,7 +33,7 @@ maxlong = -122.75
 
 m2ddlat = 111111
 m2ddlong = np.cos(np.mean((minlat,maxlat))*np.pi/180)*111111
-cell = 2000 #meter
+cell = 5000 #meter
 reslat = cell/m2ddlat
 reslong = cell/m2ddlong
 
@@ -39,29 +43,36 @@ wcee_site = psha.PSHASite(name = 'wcee_grid',
                            intensity_measures=[1,3],
                            spectral_periods=[1.0],
                            attenuations = [3],
-                           overwrite=True)
+                           overwrite=True,
+                           background_seismicity=1)
 
 # %% Run OpenSHA
 
-wcee_site.write_opensha_input(overwrite=True)
-wcee_site.run_opensha(write_output_tofile = True,
-                      overwrite=True)
+# wcee_site.write_opensha_input(overwrite=True)
+# wcee_site.run_opensha(write_output_tofile = True,
+#                       overwrite=True)
+
+wcee_site.run_r2d_opensha(write_output_tofile = True,
+                      overwrite=True,
+                      path_to_SC_GM_backend = path_to_SC_GM_backend)
+
 
 wcee_site.pickle()
 wcee_site = psha.PSHASite.unpickle('master/wcee_grid.pickle')
-
+print('opensha run finished, wcee_site pickled')
 # %% Generate samples and hazard curves
 
 np.random.seed(123)
 event_set = psha.PshaEventSet(wcee_site)
 nmaps = 10 #per erf row
-sa_intensity_ids = ["CB2014_PGA","CB2014_SA_1.0"]
+sa_intensity_ids = ["PGA","SA_1.0"]#["CB2014_PGA","CB2014_SA_1.0"]
 sa_id = sa_intensity_ids[0]
 event_set.generate_sa_maps(sa_intensity_ids, nmaps)
 im_vals = np.logspace(-3,1,100) #pga range
 event_set.generate_hazard_curves(sa_intensity_ids,im_vals)
 utils.pickle_obj(event_set)
 
+print('generate_hazard_curves run finished, event_set pickled')
 # event_set = utils.unpickle('event_set_wcee_grid.pickle')
 imvals_broad, rate_exceedance = event_set.hazard_curves[sa_id]
 test_sites = np.arange(4)
